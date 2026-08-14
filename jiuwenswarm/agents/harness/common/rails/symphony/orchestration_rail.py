@@ -16,6 +16,13 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 _ConfigBaseProvider = dict[str, Any] | Callable[[], dict[str, Any] | None] | None
 _SHORTLIST_EXTRA_KEY = "symphony_candidate_skill_ids"
 
+# Sub-agents inherit the parent's tools and rails, so ``symphony_compose_graph``
+# and this rail are both present in their context. Their session id is the only
+# marker that separates them from the parent: TaskTool and the core's session
+# tools mint ``<parent>_sub_<type>[_<hash>]``, and the code agent rail mints
+# ``<parent>_custom_<type>_<hash>``.
+_SUBAGENT_SESSION_MARKERS = ("_sub_", "_custom_")
+
 
 class SymphonyOrchestrationRail(DeepAgentRail):
     """Manage Symphony guidance, candidate injection, and viewed Skills."""
@@ -52,7 +59,11 @@ class SymphonyOrchestrationRail(DeepAgentRail):
         builder = self.system_prompt_builder
         if builder is None:
             return
-        if not self._has_compose_tool(ctx) or not self._orchestration_enabled():
+        if (
+            not self._has_compose_tool(ctx)
+            or self._is_subagent(ctx)
+            or not self._orchestration_enabled()
+        ):
             builder.remove_section(self.SECTION_NAME)
             return
 
@@ -139,11 +150,26 @@ Symphony owns ordering and graph composition. After it returns, present its
 returned `content` directly to the user. If Symphony reports missing inputs,
 ask for those inputs.
 
+After the user approves the plan, EXECUTE it: do not recompose it with
+`symphony_compose_graph`, except in the skill-gap case described below. Follow
+the plan's `steps` in order; for each step, open the skill named by
+`skill_name` (fall back to `skill_id` when `skill_name` is absent), read its
+SKILL.md once, and perform its workflow with your normal tools, passing the
+previous step's output as the next step's input. `skill_tool` only returns a
+skill's documentation: reading it is not executing it, and reading it twice
+changes nothing. When a step's workflow needs no tool, carry it out yourself and
+produce its output directly. Do not re-read a SKILL.md you have already read in
+this turn, and do not delegate the steps to sub-agents. When every step is done,
+answer with the final output and a one-line summary of the steps actually
+executed.
+
 If Symphony reports no suitable candidates, a missing capability, or caveats
 that point to a skill gap, use `search_skill` to discover external skills. When
 installing a discovered skill is appropriate, call `install_skill`; after a
 successful install, call `symphony_refresh_graph` and then call
-`symphony_compose_graph` again with the original user task.
+`symphony_compose_graph` again with the original user task. This skill gap is
+the only case that justifies calling `symphony_compose_graph` a second time,
+and only once per installed skill.
 
 For clearly ordinary tasks that do not benefit from skill capabilities, continue
 normally without Symphony.
@@ -192,6 +218,25 @@ normally without Symphony.
         return any(
             cls._model_tool_name(tool) == cls.COMPOSE_TOOL_NAME for tool in tools
         )
+
+    @staticmethod
+    def _is_subagent(ctx: AgentCallbackContext) -> bool:
+        """Whether this context belongs to a sub-agent rather than the parent.
+
+        Composition is the parent's job. A sub-agent is spawned to carry out
+        one step, so handing it the imperative "you MUST call
+        ``symphony_compose_graph``" rule makes it answer an execution request
+        with a fresh plan.
+        """
+        session = getattr(ctx, "session", None)
+        get_session_id = getattr(session, "get_session_id", None)
+        if not callable(get_session_id):
+            return False
+        try:
+            session_id = str(get_session_id() or "")
+        except Exception:
+            return False
+        return any(marker in session_id for marker in _SUBAGENT_SESSION_MARKERS)
 
     @staticmethod
     def _model_tool_name(tool: Any) -> str:

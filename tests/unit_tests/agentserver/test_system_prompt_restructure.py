@@ -53,6 +53,16 @@ class _FakeSession:
         return "sess1"
 
 
+class _FakeSubagentSession:
+    """A session id shaped like the ones TaskTool mints for sub-agents."""
+
+    def __init__(self, session_id: str = "sess1_sub_general-purpose_5058caff") -> None:
+        self._session_id = session_id
+
+    def get_session_id(self) -> str:
+        return self._session_id
+
+
 class _FakeAgent:
     def __init__(self, builder: SystemPromptBuilder) -> None:
         self.system_prompt_builder = builder
@@ -263,6 +273,89 @@ async def test_symphony_orchestration_rail_injects_when_tool_visible(
     assert "exact identifiers or names" in prompt
     assert "Do not omit this field" in prompt
     assert "skill_branch_explore" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_symphony_orchestration_guidance_defines_plan_execution(
+    monkeypatch,
+):
+    """The post-approval guidance must keep the loop-prevention invariants.
+
+    A turn that recomposed the plan instead of running it, then re-read the
+    same SKILL.md 44 times and delegated to sub-agents that replied with the
+    plan again, burned 2.6M input tokens. Each assertion below pins one of the
+    properties that keeps that from happening, so a reword cannot silently
+    drop them.
+    """
+    monkeypatch.setattr(
+        "jiuwenswarm.symphony.config.load_symphony_config",
+        lambda: SimpleNamespace(enabled=True),
+    )
+    builder = SystemPromptBuilder(language="cn")
+    agent = _FakeAgent(builder)
+    ctx = AgentCallbackContext(
+        agent=agent,
+        inputs=SimpleNamespace(
+            tools=[SimpleNamespace(name="symphony_compose_graph")],
+        ),
+        session=_FakeSession(),
+        extra={},
+    )
+
+    rail = SymphonyOrchestrationRail()
+    rail.init(agent)
+    await rail.before_model_call(ctx)
+    prompt = builder.build()
+
+    # Approval means execute, and the ban on recomposing is scoped so it does
+    # not contradict the skill-gap paragraph that legitimately asks for one.
+    assert "After the user approves the plan, EXECUTE it" in prompt
+    assert "except in the skill-gap case described below" in prompt
+    assert "the only case that justifies calling" in prompt
+
+    # Steps are addressed by installed skill name, not by capability id.
+    assert "`skill_name` (fall back to `skill_id`" in prompt
+
+    # Reading documentation is not executing, and the model owns the work.
+    assert "reading it is not executing it" in prompt
+    assert "carry it out yourself" in prompt
+    assert "Do not re-read a SKILL.md you have already read" in prompt
+    assert "do not delegate the steps to sub-agents" in prompt
+
+
+@pytest.mark.asyncio
+async def test_symphony_orchestration_rail_skips_subagents(monkeypatch):
+    """A sub-agent must not be told to compose a plan.
+
+    ``_inject_general_purpose_subagent`` hands the sub-agent the parent's tools
+    and rails, so ``symphony_compose_graph`` is visible there too. With the
+    guidance attached, a sub-agent asked to *execute* an approved plan matched
+    the imperative rule instead and called ``symphony_compose_graph`` with the
+    execution request as ``query``, answering with a fresh plan. The parent then
+    retried, which is the feedback loop that burned 2.6M tokens.
+    """
+    monkeypatch.setattr(
+        "jiuwenswarm.symphony.config.load_symphony_config",
+        lambda: SimpleNamespace(enabled=True),
+    )
+    builder = SystemPromptBuilder(language="cn")
+    agent = _FakeAgent(builder)
+    ctx = AgentCallbackContext(
+        agent=agent,
+        inputs=SimpleNamespace(
+            tools=[SimpleNamespace(name="symphony_compose_graph")],
+        ),
+        session=_FakeSubagentSession(),
+        extra={},
+    )
+
+    rail = SymphonyOrchestrationRail()
+    rail.init(agent)
+    await rail.before_model_call(ctx)
+
+    prompt = builder.build()
+    assert "## Symphony Orchestration" not in prompt
+    assert "symphony_compose_graph" not in prompt
 
 
 @pytest.mark.asyncio
